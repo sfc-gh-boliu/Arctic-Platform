@@ -106,6 +106,10 @@ def _json(request: Request, body: dict) -> list[Send]:
     return [{"json": body}]
 
 
+def _query(request: Request, body: dict) -> list[Send]:
+    return [{"params": body}]
+
+
 def _octet(wire_op: str, *, force_chunk: bool = False) -> Callable[[Request, dict], list[Send]]:
     """DSSST1 octet bodies, one send per chunk; ``wire_op`` labels the chunk envelope."""
 
@@ -150,6 +154,18 @@ def _forward(request: Request, body: dict) -> list[Send]:
 # ── normalizers: a Cortex reply -> the canonical result ─────────────────────
 def _identity(value: Any) -> Any:
     return value
+
+
+def _capacity_result(value: dict) -> dict:
+    """All six capacity fields; proto3 JSON omits false and zero values."""
+    return {
+        "has_reservation": bool(value.get("has_reservation", False)),
+        "max_total_gpus": int(value.get("max_total_gpus", 0)),
+        "reserved_gpus": int(value.get("reserved_gpus", 0)),
+        "in_use_gpus": int(value.get("in_use_gpus", 0)),
+        "pending_gpus": int(value.get("pending_gpus", 0)),
+        "available_gpus": int(value.get("available_gpus", 0)),
+    }
 
 
 def _fwd_bwd_result(result: dict) -> dict:
@@ -219,8 +235,16 @@ class _Route:
 _ROUTES = {
     # A replayed create would spawn a second job.
     "create-job": _Route("POST", "", replay_safe=False),
+    "list-jobs": _Route("GET", "", _query, normalize=lambda reply: reply.get("jobs", [])),
     "get-job": _Route("GET", "/{job}", _no_body),
     "cancel-job": _Route("POST", "/{job}:cancel", _no_body),
+    "capacity": _Route("GET", "/capacity", _query, normalize=_capacity_result),
+    "list-checkpoints": _Route(
+        "GET", "/{job}/checkpoints", _no_body, normalize=lambda reply: reply.get("checkpoints", [])
+    ),
+    "export-checkpoint": _Route("POST", "/{job}/checkpoints/{checkpoint_id}:export", _no_body),
+    # A replayed delete answers 404 for a checkpoint the first send already removed.
+    "delete-checkpoint": _Route("DELETE", "/{job}/checkpoints/{checkpoint_id}", _no_body, replay_safe=False),
     # forward-backward always carries a chunk envelope, even when the frame fits: its
     # chunk_group_id is the server's idempotency key. A mid-stream chunk-group desync
     # (GS restart) is recoverable only by re-posting the whole group.
@@ -431,17 +455,6 @@ class CortexTransport(Transport):
         # Best-effort teardown, tolerating failure (the job may be gone).
         with contextlib.suppress(requests.exceptions.RequestException):
             self.call(cancel_job_request(self.job_id))
-
-    def list_jobs(self) -> list[dict]:
-        """Every Cortex job on this account, with its status."""
-        payload = self._send("GET", self._prefix)
-        if isinstance(payload, list):
-            return payload
-        return payload.get("jobs") or payload.get("data") or []
-
-    def cancel_job(self, job_id: str) -> None:
-        """Release one job's GPUs by id."""
-        self._send("POST", f"{self._prefix}/{job_id}:cancel")
 
     # ── deliver one op ───────────────────────────────────────────────────────
     def call(self, request: Request) -> Any:
